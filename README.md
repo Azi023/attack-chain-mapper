@@ -1,281 +1,390 @@
 # attack-chain-mapper
 
-**AI-powered pentest attack chain visualizer.**
+> Turns raw pentest findings into an interactive attack chain visualization.
+> Works with any tool output. No server required.
 
-Takes completed engagement findings, reconstructs the actual attack path taken, and produces an interactive CISO-grade HTML visualization. Works with any structured findings source — including Strike7, generic JSON, and Burp-style exports.
-
-Standalone · Open-source · Integrable as PIL F7
+<!-- Screenshot: open /tmp/acm_demo.html and replace this image -->
+![Attack chain visualization](docs/assets/screenshot.png)
 
 ---
+
+## The problem
+
+Flat finding lists don't tell the story a CISO needs — they show *what* was found but not *how* the attacker moved from initial access to domain compromise. attack-chain-mapper reconstructs the actual attack path and renders it as an interactive chain diagram with one click.
 
 ## What it produces
 
-![Attack chain visualization showing the primary strike path from Host/port discovery through Anonymous LDAP bind, Credentials in SYSVOL, SMB signing disabled, up to Domain admin via NTLM relay. Left panel ranks all findings by severity. Right panel shows the chain bottom-to-top.](docs/assets/screenshot.png)
+A single self-contained HTML file you can email, open in any browser, or embed in a report:
 
-The output is a single self-contained HTML file you can email, open in any browser, or embed in a report. No server needed. No external dependencies.
-
----
-
-## What it does
-
-### 1. Ingests findings from any source
-
-Drop in a JSON file from any tool. The adapter layer handles different field names, severity formats (strings or floats), nested structures, and missing fields. If your tool isn't supported yet, `acm scaffold-adapter` generates a Claude Code prompt that writes a custom adapter for you in under 5 minutes.
-
-Supported formats:
-- **Generic JSON** — any JSON with a `findings`, `results`, `vulnerabilities`, or `issues` list
-- **Strike7** — benchmark run output (`benchmark_run_id`, `agent_steps`, nested findings)
-- **Any other format** — use `acm scaffold-adapter` to generate a custom adapter
-
-### 2. Builds the attack graph
-
-Constructs a directed acyclic graph (DAG) where nodes are findings and edges represent "this finding made the next one possible." If your data includes explicit `enabled_by` relationships, those are used directly. If not — which is the real-world case for most tools — **chain inference** is applied automatically.
-
-**Chain inference** uses:
-- Step ordering (`step_index` or array position)
-- Severity progression (lower severity findings are assumed to be prerequisites for higher ones)
-- Host proximity (findings on the same host or subnet are more likely to be causally linked)
-
-Inferred edges are labelled `[inferred]` in CLI output and flagged in the graph so you can distinguish them from explicit relationships.
-
-### 3. Identifies the primary attack chain
-
-Uses a longest-weighted-path algorithm (DP over topological sort, O(V+E)) to find the most impactful sequence of exploits — from the initial entry point to the highest-severity crown jewel. Findings not on the primary chain are listed as secondary findings.
-
-### 4. Scores the chain
-
-Computes a **chain risk score** = Σ(severity × step_weight), where later steps in the chain carry a higher weight (1.0→2.0 from entry to crown jewel). This gives a single number suitable for CISO-level reporting.
-
-### 5. Generates AI finding details (optional, BYOK)
-
-If you provide an Anthropic API key, each finding gets enriched with:
-- **AI analysis** — what the vulnerability is, why it exists, what the attacker did with it
-- **Remediation** — concrete, numbered, actionable steps
-- **Confidence** — the model's confidence this is a true positive
-
-All AI calls are async and non-blocking. The chain renders immediately; AI details stream in as they complete. If no API key is provided, pre-written details from the fixture are shown instead — the demo works fully with no key.
-
-### 6. Renders an interactive HTML report
-
-The output is a single `.html` file containing:
-
-| Feature | Description |
-|---|---|
-| Left panel | All findings ranked by severity, colour-coded (critical=red → info=grey), clickable |
-| Right panel | Primary attack chain, entry point at bottom → crown jewel at top |
-| Animated arrows | SVG flow arrows with CSS animation showing direction of chain progression |
-| Node click | Selecting any node highlights it simultaneously in both panels |
-| Detail drawer | Slides in from the right: AI analysis, MITRE link, evidence, remediation, confidence bar |
-| Secondary findings | Findings not in the primary chain listed below the main chain |
-| Chain risk score | Aggregate score shown prominently at the top for CISO reporting |
-| Timeline bar | Attack progression plotted by timestamp at the bottom of the right panel |
-| Export button | Downloads a fully self-contained copy of the HTML (no server, no dependencies) |
-| Responsive | Works at 1200px and 1600px without horizontal scroll |
+- **Interactive SVG chain** — primary attack path rendered bottom-to-top, entry point at the bottom, crown jewel at the top, animated flow arrows showing progression
+- **Finding detail drawer** — click any node to see AI-generated analysis, remediation steps, MITRE ATT&CK link, and evidence
+- **Chain risk score** — aggregate severity score for the full chain, prominent for CISO review
+- **Left panel** — all findings ranked by severity, colour-coded, with chain membership badges
+- **Timeline bar** — horizontal axis at the bottom showing step index and timestamp progression
+- **Multiple chains** — if the engagement has independent attack chains, each gets its own tab
+- **Export button** — downloads the chain as a self-contained HTML file
 
 ---
 
 ## Quick start
 
 ```bash
-git clone https://github.com/Azi023/attack-chain-mapper.git
+git clone https://github.com/Azi023/attack-chain-mapper
 cd attack-chain-mapper
-python3 -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-
-# Run the demo (no API key needed)
-python demo/run_demo.py
-# → output: /tmp/acm_demo.html — open in any browser
+python demo/run_demo.py        # generates /tmp/acm_demo.html
+open /tmp/acm_demo.html        # or xdg-open on Linux
 ```
+
+No API key needed — the demo uses pre-written AI details from the GOAD fixture.
 
 ---
 
 ## CLI reference
 
+### `acm discover` — inspect any file before processing
+
 ```bash
-# Detect format, show field mapping, check if chain inference will be needed
-python -m acm discover path/to/engagement.json
-
-# Generate chain HTML (no API key — uses pre-written details if present)
-python -m acm chain path/to/engagement.json --output chain.html
-
-# Generate chain with live AI analysis
-export ANTHROPIC_API_KEY=sk-ant-...
-python -m acm chain path/to/engagement.json --output chain.html --model claude-sonnet-4-5
-
-# Generate a Claude Code prompt for a custom adapter (paste into Claude Code)
-python -m acm scaffold-adapter path/to/unknown_format.json
-
-# Start the FastAPI server (POST /chain)
-python -m acm serve --port 8200
+acm discover path/to/your_tool_output.json
 ```
-
-### `discover` output example
 
 ```
   File:        engagement.json
-  Format:      strike7
+  Format:      generic
   Findings:    12
-  Chain links: ✗ missing — chain inference will be applied automatically
+  Chain links: enabled_by present on 8 of 12 findings
 
   Field mapping:
     id                           ✓ found
-    title                        ✓ found  [source: name]
-    severity                     ✓ found  [source: risk_score]
-    mitre_technique              ✓ found  [source: technique]
-    host                         ✓ found  [source: target]
+    title                        ✓ found
+    severity                     ✓ found  [source: cvss_score]
+    mitre_technique              ✓ found
+    enabled_by                   ✓ found
 
-  Missing CRITICAL fields:
-    enabled_by                   ✗ missing — chain inference will be applied
+  Missing optional fields (will be null):
+    step_index                   — not present
+```
+
+### `acm chain` — generate the visualization
+
+```bash
+acm chain path/to/findings.json --output report.html
+
+# With AI enrichment (requires Anthropic API key)
+ANTHROPIC_API_KEY=sk-ant-... acm chain findings.json --output report.html --model claude-sonnet-4-5
+```
+
+### `acm list` — view stored engagements
+
+```bash
+acm list
+```
+
+```
+  ENGAGEMENT ID                        TARGET               CHAINS   LATEST DATE          RISK
+  ------------------------------------ -------------------- ------- -------------------- -----
+  goad-2024-demo-001                   GOAD Lab             1       2026-03-17T10:45     35.1
+```
+
+### `acm history` — all chains for an engagement
+
+```bash
+acm history goad-2024-demo-001
+```
+
+### `acm diff` — compare two chain snapshots
+
+```bash
+acm diff ac7f5834 b55f1034
+```
+
+```
+  Diff: ac7f5834 → b55f1034
+  Risk score delta: -26.6
+  Primary path changed: yes
+
+  New findings (2):
+    + [0.5] Port scan
+    + [8.0] New finding
+
+  Resolved findings (6):
+    - [9.8] Domain admin compromise via NTLM relay to DC01 LDAP
+    ...
+```
+
+### `acm scaffold-adapter` — generate a custom adapter for unknown formats
+
+```bash
+acm scaffold-adapter path/to/unknown_format.json
+# Prints a Claude Code prompt that generates a working adapter
 ```
 
 ---
 
-## Strike7 integration
+## Integrating with your tool
 
-Attack-chain-mapper is designed to ingest Strike7 benchmark run output directly.
+attack-chain-mapper is designed to work alongside any pentest platform, scanner,
+or AI agent — without requiring changes to your existing codebase.
 
-### Step 1: Discover the format
+### Step 1: Check if your output is recognized
 
 ```bash
-python -m acm discover path/to/strike7_run_output.json
+acm discover path/to/your_tool_output.json
 ```
 
-This identifies the format, maps fields, and tells you whether chain inference will be applied.
+This shows which fields were detected and whether chain inference will be needed.
 
 ### Step 2: Generate the chain
 
 ```bash
-python -m acm chain path/to/strike7_run_output.json --output chain.html
+acm chain path/to/your_tool_output.json --output report.html
 ```
 
-The Strike7 adapter handles:
-- Findings nested inside `agent_steps[*].findings`
-- Top-level `findings` and `vulnerabilities` keys
-- String severity labels (`"HIGH"`, `"CRITICAL"`) → CVSS floats (7.5, 9.5)
-- Strike7-specific field names: `technique`, `proof`, `output`, `command_output`, `target`, `hostname`, `risk`, `risk_score`
-- `step_index` and `timestamp_offset_s` injected from the parent `agent_step` record
-
-### Step 3: With AI analysis
+### Step 3: If your format isn't recognized
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-python -m acm chain path/to/strike7_run_output.json \
-  --output chain.html \
-  --model claude-sonnet-4-5
+# Generate a custom adapter (requires Anthropic API key)
+acm scaffold-adapter path/to/your_output.json
+
+# Or let the tool detect it automatically
+acm chain path/to/your_output.json --output report.html
+# → "Format not recognized — running AI format detection..."
 ```
 
-### PIL F7 integration (one-function API)
+### Python API (for platform integration)
 
 ```python
-from src import build_chain
-from src.ingestion.adapters.strike7 import Strike7Adapter
+from attack_chain_mapper import build_chain
 
 chain = build_chain(
-    engagement_data=engagement_dict,   # raw dict from Strike7 output
-    adapter=Strike7Adapter(),
-    api_key=None,                      # PIL controls whether AI is called
-    infer_chain=True,                  # auto-infer when enabled_by is absent
+    engagement_data=your_findings_dict,
+    api_key="sk-ant-...",   # optional
+    store=True,             # save to local SQLite
 )
+html = chain.render_html()        # embed in your report pipeline
+data = chain.to_json()           # store or forward to downstream systems
 
-html = chain.render_html()            # str — complete self-contained HTML
-data = chain.to_json()               # dict — for PIL SQLite storage
-path = chain.primary_path            # list[Finding] — the attack chain
-score = chain.chain_risk_score       # float — for CISO dashboard
+# Multi-chain access
+for cr in chain.chains:
+    print(f"{cr.label}: {cr.chain_risk_score:.2f}")
 ```
 
+### What attack-chain-mapper needs from your data
+
+The minimum required fields for a useful chain:
+- Finding title or name
+- Severity (numeric or label — CRITICAL/HIGH/MEDIUM/LOW/INFO)
+
+Optional but improve quality significantly:
+- MITRE ATT&CK technique (T-number)
+- Step index or timestamp
+- Evidence or proof text
+- `enabled_by` (IDs of findings that made this one possible)
+
+If `enabled_by` is absent — which is normal — the tool infers chain
+relationships automatically from severity progression and step ordering.
+
 ---
 
-## Chain inference — how it works
+## Multiple attack chains
 
-Most real-world tool outputs don't include explicit `enabled_by` relationships between findings. Without those, there's no chain — just a list.
+attack-chain-mapper automatically detects disconnected attack chains within a single engagement. If you have findings from multiple target systems or attack paths with no shared prerequisites, each is rendered as a separate chain.
 
-Chain inference solves this by heuristically linking findings based on three signals:
+When multiple chains are detected:
+- A **tab bar** appears at the top of the chain panel: `Chain 1 · 35.07` | `Chain 2 · 18.42`
+- Each chain has its own Crown Jewel and Entry Point
+- The left panel shows all findings with `C1`/`C2`/`C3` badges
+- Findings not in any chain's primary path appear in "Not in Any Chain"
+- The header shows the primary (highest-risk) chain's score
 
-1. **Step ordering** — findings that come earlier in the engagement timeline are prerequisites for later ones
-2. **Severity progression** — a lower-severity finding is assumed to be a prerequisite for a higher-severity one. Recon enables foothold enables escalation.
-3. **Host proximity** — findings on the same host or /24 subnet are more likely to be causally linked than findings on different targets
-
-Inferred edges are flagged in the output so you can distinguish them from explicit relationships. Explicit `enabled_by` values in the source data are always respected and never overridden.
-
-This is what makes the tool genuinely useful on real engagement data, not just on pre-structured synthetic fixtures.
+The highest-risk chain is always Chain 1. Chains are scored and sorted by risk automatically.
 
 ---
 
-## API key setup
+## AI enrichment (optional)
 
-The tool **never ships with or assumes an API key**. Provide your own:
+Provide your own Anthropic API key to generate per-finding analysis:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-# or
-python -m acm chain input.json --output chain.html --api-key sk-ant-...
+acm chain findings.json --output report.html --model claude-sonnet-4-5
 ```
 
-Without a key: the chain renders immediately with pre-written details (if present in the fixture) or a placeholder message. The demo works fully with no key.
+What AI enrichment adds:
+- Full technical analysis for each finding (adapted to evidence richness)
+- Step-by-step remediation guidance
+- AI confidence score per finding
+- MITRE ATT&CK technique descriptions
 
-Recommended models: `claude-sonnet-4-5` (default) or `claude-sonnet-4-6`.
+Without an API key: the chain renders immediately using any pre-written AI details in the fixture. The visualization is fully functional — only the per-finding analysis section will be empty.
 
----
+Recommended models: `claude-sonnet-4-5` or `claude-sonnet-4-6`.
 
-## Finding schema (locked)
-
-Adapters map TO this schema. The schema never changes to suit an adapter.
-
-```python
-class Finding(BaseModel):
-    id: str                           # unique, stable across retests
-    title: str                        # short human title
-    severity: float                   # 0.0–10.0 CVSS-style
-    severity_label: str               # CRITICAL / HIGH / MEDIUM / LOW / INFO
-    mitre_technique: Optional[str]    # e.g. "T1557.001"
-    step_index: Optional[int]         # agent step number
-    timestamp_offset_s: Optional[int] # seconds from engagement start
-    enabled_by: List[str]             # prerequisite finding IDs ([] if unknown)
-    evidence: Optional[str]           # raw evidence text
-    host: Optional[str]               # target host/IP
-    ai_detail: Optional[str]          # AI-generated or pre-written detail
-    ai_remediation: Optional[str]     # AI-generated or pre-written remediation
-    ai_confidence: Optional[float]    # confidence 0.0–1.0
-```
+> **Privacy:** All finding data is local. Nothing leaves your machine unless you explicitly configure an external AI API call with `--api-key` or `ANTHROPIC_API_KEY`. This is documented in every CLI help string.
 
 ---
 
 ## Architecture
 
 | Component | Technology | Notes |
-|---|---|---|
-| Graph engine | NetworkX DAG | Longest-weighted-path for primary chain (O(V+E) DP) |
-| Renderer | Pure HTML + vanilla JS | Single self-contained file, no React/Vue, can be emailed |
-| API | FastAPI | `POST /chain` → JSON + HTML |
-| AI enrichment | Anthropic API (BYOK) | Async, one call per finding, non-blocking |
-| Adapters | Plugin pattern | One file per format, registered in `adapters/__init__.py` |
-| Chain inference | Heuristic DAG | Step order + severity + host proximity |
-
----
-
-## Running tests
-
-```bash
-python -m pytest tests/ -q
-# 159 tests, 0 failures
-```
-
-Test coverage includes: schema validation, graph construction, cycle detection, pathfinder, chain inference, Strike7 adapter, generic adapter, format detector, and AI client.
+|-----------|-----------|-------|
+| Finding schema | Pydantic v2 | Locked contract — adapters map TO this |
+| Graph engine | NetworkX DAG | Longest weighted path = primary chain |
+| Chain inference | Heuristic + MITRE | Auto-infers `enabled_by` when absent |
+| Renderer | Pure HTML + vanilla JS | Single self-contained file, no framework |
+| AI enrichment | Anthropic API (BYOK) | One call per finding, async-safe |
+| Storage | SQLite WAL | Chains saved locally for diff/history |
+| API | FastAPI | `POST /chain` → graph JSON + rendered HTML |
 
 ---
 
 ## Privacy
 
-All processing is local. No finding data leaves your machine unless you explicitly configure an Anthropic API call with `--api-key`. The HTML output contains no credentials. No telemetry, no analytics, no network calls except the optional LLM enrichment you choose to trigger.
+All processing is **local by default**:
+
+- Finding data never leaves your machine unless you provide an Anthropic API key
+- SQLite database is stored at `~/.attack-chain-mapper/chains.db`
+- HTML output contains no credentials — safe to email or attach to reports
+- AI API calls are per-finding and non-blocking; you can disable them with `--no-ai-detect`
+
+---
+
+## Finding schema
+
+The schema is the contract. Adapters map TO it; the schema never changes to suit adapters.
+
+```python
+class Finding(BaseModel):
+    id: str                        # unique within engagement
+    title: str                     # short human title
+    severity: float                # CVSS-style 0.0–10.0
+    severity_label: str            # CRITICAL / HIGH / MEDIUM / LOW / INFO
+    mitre_technique: Optional[str] # T-number e.g. "T1557.001"
+    step_index: Optional[int]      # which step produced this finding
+    timestamp_offset_s: Optional[int]  # seconds from engagement start
+    enabled_by: List[str]          # finding IDs that made this possible
+    evidence: Optional[str]        # raw evidence string (redacted is fine)
+    host: Optional[str]            # target host/IP
+    # AI-generated fields (populated after graph is built)
+    ai_detail: Optional[str]
+    ai_remediation: Optional[str]
+    ai_confidence: Optional[float]
+```
 
 ---
 
 ## Adding a custom adapter
 
+Use the scaffold command to generate a ready-to-implement adapter:
+
 ```bash
-# Get a scaffold prompt for your tool's output format:
-python -m acm scaffold-adapter path/to/your_format.json
-# Paste the printed prompt into Claude Code — it writes the adapter for you
+acm scaffold-adapter path/to/your_output.json
 ```
 
-Or follow the pattern in `src/ingestion/adapters/generic.py`. An adapter is ~60-80 lines: a `parse()` method that maps your source fields to `Finding` objects, and a `describe_mapping()` method for `acm discover`.
+This prints a Claude Code prompt that inspects your format and generates a working adapter. Paste it into Claude Code — no one needs to know your internal schema.
+
+Or implement manually following `src/ingestion/adapters/generic.py`:
+- One file per format in `src/ingestion/adapters/`
+- Register in `src/ingestion/adapters/__init__.py`
+- Implement `can_handle(cls, data)`, `parse(self, data) -> Engagement`, `describe_mapping(self, data) -> dict`
+
+---
+
+## PIL F7 integration
+
+```python
+from attack_chain_mapper import build_chain
+
+# One-line integration
+chain = build_chain(engagement_data=your_pil_output, api_key=api_key, store=True)
+
+# Embed in report
+report["attack_chain_html"] = chain.render_html()
+report["chain_risk_score"] = chain.chain_risk_score
+report["chain_count"] = chain.chain_count
+report["total_engagement_risk"] = chain.total_engagement_risk
+```
+
+---
+
+## Running with Claude Code
+
+If you want Claude Code to integrate attack-chain-mapper into your existing
+pentest platform or AI agent pipeline, use this prompt:
+
+<details>
+<summary>Claude Code integration prompt (click to expand)</summary>
+
+```
+You are integrating attack-chain-mapper into [YOUR TOOL NAME].
+Repository: https://github.com/Azi023/attack-chain-mapper
+
+First, read the README at that URL to understand the tool's architecture,
+finding schema, and Python API.
+
+Then do the following:
+
+1. Install the package:
+   pip install git+https://github.com/Azi023/attack-chain-mapper.git
+
+2. Run the demo to verify it works:
+   python -m acm chain demo/fixtures/goad_sample.json --output /tmp/test_chain.html
+   Confirm /tmp/test_chain.html is > 20KB.
+
+3. Export a sample output from [YOUR TOOL] as JSON and run:
+   python -m acm discover path/to/your_output.json
+   Report what fields were detected and whether chain inference will be applied.
+
+4. If the format is recognized: integrate using the Python API:
+   from attack_chain_mapper import build_chain
+   chain = build_chain(engagement_data=your_findings, api_key=YOUR_KEY)
+   html = chain.render_html()
+
+5. If the format is NOT recognized: run the scaffold-adapter command and
+   implement the generated adapter before integrating.
+
+6. Do NOT modify attack-chain-mapper's source code to fit your format.
+   The adapter pattern is the correct integration point — see src/ingestion/adapters/generic.py.
+
+7. Verify the integration works end-to-end on real data from your tool before
+   committing. The chain should show at least 2 connected nodes for the test to
+   be meaningful.
+
+Use model: claude-sonnet-4-5 or claude-sonnet-4-6 for best results.
+```
+
+</details>
+
+---
+
+## Development
+
+```bash
+# Install
+pip install -e ".[dev]"
+
+# Run demo (no API key needed)
+python demo/run_demo.py
+
+# Run tests
+python -m pytest tests/ -q
+
+# Discover format of an existing file
+acm discover sample.json
+
+# Generate a chain
+acm chain sample.json --output chain.html
+
+# Generate a chain with AI details
+ANTHROPIC_API_KEY=sk-ant-... acm chain sample.json --output chain.html --model claude-sonnet-4-5
+
+# Start API server
+uvicorn src.api.app:app --port 8200
+```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE)

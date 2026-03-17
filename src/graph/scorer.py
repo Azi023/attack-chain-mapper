@@ -66,3 +66,31 @@ def risk_score_color(score: float, max_score: float = 100.0) -> str:
     if ratio >= 0.2:
         return "#f39c12"
     return "#7f8c8d"
+
+
+def score_all_chains(chains: list, findings_by_id: dict) -> list:
+    """Score each ChainResult using its path findings. Mutates chain_risk_score in-place.
+
+    Args:
+        chains: list of ChainResult objects
+        findings_by_id: dict mapping finding ID → Finding object
+
+    Returns the same list with updated chain_risk_score values.
+    """
+    for cr in chains:
+        path_findings = [findings_by_id[nid] for nid in cr.primary_path if nid in findings_by_id]
+        cr.chain_risk_score = compute_chain_risk_score(path_findings)
+    return chains
+
+
+def total_engagement_risk(chains: list) -> float:
+    """Compute engagement-level risk as a weighted sum of all chain scores.
+
+    Chain 1 weight = 1.0, Chain 2 = 0.8, Chain 3 = 0.6, etc. (min 0.2).
+    This prevents a long tail of minor chains inflating the total.
+    """
+    total = 0.0
+    for i, cr in enumerate(chains):
+        weight = max(1.0 - i * 0.2, 0.2)
+        total += cr.chain_risk_score * weight
+    return round(total, 2)

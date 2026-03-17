@@ -11,12 +11,14 @@ Public API for PIL F7 integration:
         model="claude-sonnet-4-5",
         infer_chain=True,      # auto-infer enabled_by when missing
     )
-    html = chain.render_html()       # str: complete HTML
-    data = chain.to_json()           # dict: machine-readable
-    path = chain.primary_path        # list[Finding]
+    html = chain.render_html()              # str: complete HTML
+    data = chain.to_json()                  # dict: machine-readable
+    path = chain.primary_path               # list[Finding] (highest-risk chain)
+    chains = chain.chains                   # list[ChainResult] (all chains)
+    total_risk = chain.total_engagement_risk  # weighted engagement risk
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Any
 
 from src.ingestion.schema import Finding, Engagement
@@ -24,8 +26,8 @@ from src.ingestion.detector import detect_format
 from src.ingestion.adapters import get_adapter
 from src.graph.builder import build_graph
 from src.graph.inference import infer_and_build, mark_inferred_edges
-from src.graph.pathfinder import find_primary_chain, find_secondary_findings
-from src.graph.scorer import compute_chain_risk_score
+from src.graph.pathfinder import find_all_chains, find_secondary_findings, ChainResult
+from src.graph.scorer import score_all_chains, total_engagement_risk as calc_total_risk
 from src.renderer.html import render_html
 from src.renderer.json_export import export_graph_json
 
@@ -33,18 +35,27 @@ from src.renderer.json_export import export_graph_json
 @dataclass
 class AttackChain:
     engagement: Engagement
-    primary_path: list[Finding]
-    secondary_findings: list[Finding]
-    chain_risk_score: float
+    primary_path: list[Finding]          # backward compat: highest-risk chain findings
+    secondary_findings: list[Finding]    # findings not in any chain's primary path
+    chain_risk_score: float              # backward compat: highest-risk chain score
     inferred_ids: set[str]
+    chains: list[ChainResult] = field(default_factory=list)  # all detected chains
+    total_engagement_risk: float = 0.0   # weighted sum across all chains
+    chain_count: int = 0                 # number of distinct chains
+
+    @property
+    def findings(self) -> list[Finding]:
+        """All findings in the engagement (for renderer duck-typing)."""
+        return self.engagement.findings
+
+    @property
+    def primary_chain(self) -> ChainResult | None:
+        """Highest-risk ChainResult, or None if no chains detected."""
+        return self.chains[0] if self.chains else None
 
     def render_html(self) -> str:
-        return render_html(
-            self.engagement,
-            self.primary_path,
-            self.secondary_findings,
-            self.chain_risk_score,
-        )
+        title = self.engagement.target_name or self.engagement.engagement_id
+        return render_html(self, engagement_title=title)
 
     def to_json(self) -> dict:
         return export_graph_json(
@@ -76,7 +87,7 @@ def build_chain(
         db_path: override the default DB path (~/.attack-chain-mapper/chains.db)
 
     Returns:
-        AttackChain with primary_path, secondary_findings, render_html(), to_json()
+        AttackChain with chains, primary_path, render_html(), to_json()
     """
     if adapter is None:
         fmt = detect_format(engagement_data)
@@ -114,9 +125,30 @@ def build_chain(
         if inferred_ids:
             mark_inferred_edges(G, inferred_ids)
 
-    primary = find_primary_chain(G)
-    secondary = find_secondary_findings(G, primary)
-    risk_score = compute_chain_risk_score(primary)
+    chains = find_all_chains(G)
+    findings_by_id = {f.id: f for f in engagement.findings}
+    chains = score_all_chains(chains, findings_by_id)
+
+    primary = []
+    if chains:
+        from src.graph.builder import get_node_finding
+        for nid in chains[0].primary_path:
+            f = get_node_finding(G, nid)
+            if f is not None:
+                primary.append(f)
+
+    # Secondary = findings not in any chain's primary path
+    all_primary_ids: set[str] = set()
+    for cr in chains:
+        all_primary_ids.update(cr.primary_path)
+    secondary = [
+        f for f in engagement.findings
+        if f.id not in all_primary_ids
+    ]
+    secondary.sort(key=lambda f: f.severity, reverse=True)
+
+    risk_score = chains[0].chain_risk_score if chains else 0.0
+    eng_risk = calc_total_risk(chains)
 
     attack_chain = AttackChain(
         engagement=engagement,
@@ -124,6 +156,9 @@ def build_chain(
         secondary_findings=secondary,
         chain_risk_score=risk_score,
         inferred_ids=inferred_ids,
+        chains=chains,
+        total_engagement_risk=eng_risk,
+        chain_count=len(chains),
     )
 
     if store:

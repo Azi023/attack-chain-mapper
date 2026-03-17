@@ -4,8 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "attack-chain-mapper"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-powered pentest attack chain visualizer"
+readme = "README.md"
+license = {text = "MIT"}
+keywords = ["pentesting", "security", "attack-chain", "visualization", "mitre-attack"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0",

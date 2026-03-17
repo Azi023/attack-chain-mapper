@@ -2,6 +2,7 @@
 
 Design: light bg (#f5f6f8), SVG chain panel, animated dashed connectors,
 bottom detail drawer, dynamic layout from findings data.
+Multi-chain: if multiple independent chains detected, shows a tab selector.
 """
 from __future__ import annotations
 
@@ -106,6 +107,7 @@ def _finding_to_js(
     crown_id: str,
     entry_id: str,
     fork_labels: dict[str, str],
+    chain_idx: int = -1,
 ) -> dict:
     rem_list: list[str] = []
     if f.ai_remediation:
@@ -136,6 +138,7 @@ def _finding_to_js(
         "rem": rem_list,
         "ev": f.evidence or "",
         "conf": conf,
+        "chain_idx": chain_idx,
     }
 
 
@@ -144,26 +147,73 @@ def _finding_to_js(
 def render_html(chain, engagement_title: str = "Pentest Engagement") -> str:
     """
     chain: object with .findings (list[Finding]), .primary_path (list[Finding]),
-           .chain_risk_score (float)
+           .chain_risk_score (float), and optionally .chains (list[ChainResult])
     Returns: complete self-contained HTML string.
     """
     findings: list[Finding] = chain.findings
     primary_path: list[Finding] = chain.primary_path
     risk_score: float = chain.chain_risk_score
 
+    chains_list = getattr(chain, "chains", [])
+
+    # If no chains data available (backward compat), create a synthetic single-chain entry
+    if not chains_list:
+        from src.graph.pathfinder import ChainResult
+        crown_id_bc = primary_path[-1].id if primary_path else ""
+        entry_id_bc = primary_path[0].id if primary_path else ""
+        chains_list = [ChainResult(
+            chain_index=1,
+            primary_path=[f.id for f in primary_path],
+            crown_jewel_id=crown_id_bc,
+            entry_point_id=entry_id_bc,
+            secondary_findings=[],
+            chain_risk_score=risk_score,
+            component_size=len(primary_path),
+            label="Chain 1",
+        )]
+
     primary_ids = {f.id for f in primary_path}
     crown_id = primary_path[-1].id if primary_path else ""
     entry_id = primary_path[0].id if primary_path else ""
 
-    fork_labels = _compute_fork_labels(primary_path, findings)
-    layout = _compute_primary_layout(primary_path, findings)
+    # Map finding ID → chain index (0-based, -1 if not in any chain's primary path)
+    finding_chain_idx: dict[str, int] = {}
+    for cr in chains_list:
+        for fid in cr.primary_path:
+            finding_chain_idx[fid] = cr.chain_index - 1  # 0-based
+
+    fmap = {f.id: f for f in findings}
+
+    # Build per-chain layout and fork-label data
+    chains_tab_data = []
+    for cr in chains_list:
+        chain_path_findings = [fmap[fid] for fid in cr.primary_path if fid in fmap]
+        chain_layout = _compute_primary_layout(chain_path_findings, findings)
+        fork_lbl = _compute_fork_labels(chain_path_findings, findings)
+        chains_tab_data.append({
+            "index": cr.chain_index,
+            "label": cr.label,
+            "risk": round(cr.chain_risk_score, 2),
+            "steps": len(chain_path_findings),
+            "primary_ids": cr.primary_path,
+            "crown_id": cr.crown_jewel_id,
+            "entry_id": cr.entry_point_id,
+            "layout": chain_layout,
+            "fork_labels": fork_lbl,
+        })
+
+    # Chain 1 layout for NODE_LAYOUT (backward-compat placeholder still injected)
+    layout = chains_tab_data[0]["layout"] if chains_tab_data else {}
+    fork_labels = chains_tab_data[0]["fork_labels"] if chains_tab_data else {}
 
     js_findings = [
-        _finding_to_js(f, primary_ids, crown_id, entry_id, fork_labels)
+        _finding_to_js(f, primary_ids, crown_id, entry_id, fork_labels,
+                       finding_chain_idx.get(f.id, -1))
         for f in findings
     ]
     findings_json = json.dumps(js_findings, ensure_ascii=False)
     layout_json = json.dumps(layout, ensure_ascii=False)
+    chains_json = json.dumps(chains_tab_data, ensure_ascii=False)
     risk_str = f"{risk_score:.2f}"
     primary_len = str(len(primary_path))
 
@@ -185,6 +235,7 @@ def render_html(chain, engagement_title: str = "Pentest Engagement") -> str:
     html = html.replace("__PRIMARY_LEN__", primary_len)
     html = html.replace("__FINDINGS_JSON__", findings_json)
     html = html.replace("__LAYOUT_JSON__", layout_json)
+    html = html.replace("__CHAINS_JSON__", chains_json)
     return html
 
 
@@ -196,6 +247,22 @@ def render_to_file(
     output_path: str | Path,
 ) -> Path:
     """Backward-compatible wrapper: accepts old 5-arg signature, calls render_html."""
+    from src.graph.pathfinder import ChainResult
+
+    crown_id = primary_chain[-1].id if primary_chain else ""
+    entry_id = primary_chain[0].id if primary_chain else ""
+
+    syn_chain = ChainResult(
+        chain_index=1,
+        primary_path=[f.id for f in primary_chain],
+        crown_jewel_id=crown_id,
+        entry_point_id=entry_id,
+        secondary_findings=[f.id for f in secondary_findings],
+        chain_risk_score=chain_risk_score,
+        component_size=len(primary_chain),
+        label="Chain 1",
+    )
+
     class _ChainAdapter:
         pass
 
@@ -203,6 +270,7 @@ def render_to_file(
     adapter.findings = engagement.findings
     adapter.primary_path = primary_chain
     adapter.chain_risk_score = chain_risk_score
+    adapter.chains = [syn_chain]
 
     title = engagement.target_name or engagement.engagement_id
     html = render_html(adapter, engagement_title=title)
@@ -286,11 +354,20 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .frow.dim .fbar{opacity:0.25}
 
 /* RIGHT */
-#right{flex:1;overflow-y:auto;overflow-x:hidden;padding:20px 24px;background:var(--bg)}
-#right::-webkit-scrollbar{width:4px}
-#right::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+#right{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+#right-inner{flex:1;overflow-y:auto;overflow-x:hidden;padding:20px 24px}
+#right-inner::-webkit-scrollbar{width:4px}
+#right-inner::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 #chain-hdr{font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);font-weight:600;margin-bottom:16px}
 #chain-svg{width:100%;display:block}
+
+/* CHAIN TABS */
+#chain-tabs{display:none;gap:0;border-bottom:1px solid var(--border);background:var(--surface);overflow-x:auto;flex-shrink:0}
+.chain-tab{padding:8px 16px;font-size:11px;font-weight:500;cursor:pointer;border-right:1px solid var(--border);white-space:nowrap;color:var(--muted);transition:all 0.12s}
+.chain-tab:hover{background:var(--bg);color:var(--text)}
+.chain-tab.active{background:var(--bg);color:var(--text);border-bottom:2px solid var(--blue)}
+.chain-tab .tab-score{color:var(--crit);font-weight:700;margin-left:4px}
+.cbadge{padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;color:var(--blue);border:1px solid var(--blue-bg);background:var(--blue-bg);margin-left:4px;flex-shrink:0}
 
 /* SVG node interactions */
 .nrect{transition:stroke 0.15s,filter 0.15s}
@@ -345,16 +422,19 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 <div id="body">
   <div id="left"></div>
   <div id="right">
-    <div id="chain-hdr">Primary Attack Chain &mdash; __PRIMARY_LEN__ Steps</div>
-    <svg id="chain-svg" xmlns="http://www.w3.org/2000/svg">
-      <defs id="chain-defs">
-        <marker id="arr-CRITICAL" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#d92d20"/></marker>
-        <marker id="arr-HIGH" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#c4320a"/></marker>
-        <marker id="arr-MEDIUM" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#b54708"/></marker>
-        <marker id="arr-LOW" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#667085"/></marker>
-        <marker id="arr-INFO" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#98a2b3"/></marker>
-      </defs>
-    </svg>
+    <div id="chain-tabs"></div>
+    <div id="right-inner">
+      <div id="chain-hdr">Primary Attack Chain &mdash; __PRIMARY_LEN__ Steps</div>
+      <svg id="chain-svg" xmlns="http://www.w3.org/2000/svg">
+        <defs id="chain-defs">
+          <marker id="arr-CRITICAL" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#d92d20"/></marker>
+          <marker id="arr-HIGH" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#c4320a"/></marker>
+          <marker id="arr-MEDIUM" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#b54708"/></marker>
+          <marker id="arr-LOW" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#667085"/></marker>
+          <marker id="arr-INFO" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><polygon points="0,0 8,4 0,8" fill="#98a2b3"/></marker>
+        </defs>
+      </svg>
+    </div>
   </div>
 </div>
 <div id="dov">
@@ -391,22 +471,59 @@ const SEV={
 };
 const F=__FINDINGS_JSON__;
 const NODE_LAYOUT=__LAYOUT_JSON__;
+const CHAINS=__CHAINS_JSON__;
 const FM={};F.forEach(f=>FM[f.id]=f);
 let AID=null;
+let ACTIVE_CHAIN=0;
+let ACTIVE_PRIMARY_IDS=new Set(CHAINS.length>0?CHAINS[0].primary_ids:[]);
 const sc=(l)=>SEV[l]?.color||'#667085';
 const fmt=(s)=>s===0?'0.0':s.toFixed(1);
 
+function buildTabs(){
+  const el=document.getElementById('chain-tabs');
+  if(!el||CHAINS.length<2){if(el)el.style.display='none';return;}
+  el.style.display='flex';el.innerHTML='';
+  CHAINS.forEach((c,i)=>{
+    const t=document.createElement('div');t.className='chain-tab'+(i===0?' active':'');
+    t.onclick=()=>switchChain(i);
+    const score=document.createElement('span');score.className='tab-score';score.textContent=c.risk.toFixed(2);
+    t.textContent='Chain '+c.index+' ';t.appendChild(score);
+    el.appendChild(t);
+  });
+}
+
+function switchChain(idx){
+  ACTIVE_CHAIN=idx;
+  ACTIVE_PRIMARY_IDS=new Set(CHAINS[idx].primary_ids);
+  document.querySelectorAll('.chain-tab').forEach((t,i)=>t.classList.toggle('active',i===idx));
+  const c=CHAINS[idx];
+  document.getElementById('chain-hdr').textContent=c.label+' \u2014 '+c.steps+' Steps';
+  closeDrawer();
+  buildSVG();
+}
+
 function buildLeft(){
   const p=document.getElementById('left');p.innerHTML='';
-  const h=document.createElement('div');h.className='lhdr';h.textContent='All Findings ('+F.filter(x=>x.pri).length+')';p.appendChild(h);
-  F.filter(f=>f.pri).forEach(f=>p.appendChild(mkRow(f,false)));
-  const sec=F.filter(f=>!f.pri);
-  if(sec.length){
-    const d=document.createElement('div');d.className='sdiv';d.textContent='Not in Primary Chain';p.appendChild(d);
-    sec.forEach(f=>p.appendChild(mkRow(f,true)));
+  if(CHAINS.length>1){
+    const h=document.createElement('div');h.className='lhdr';h.textContent='All Findings ('+F.length+')';p.appendChild(h);
+    const inAnyChain=F.filter(f=>f.chain_idx>=0).sort((a,b)=>a.chain_idx-b.chain_idx||b.s-a.s);
+    inAnyChain.forEach(f=>p.appendChild(mkRow(f,false,f.chain_idx+1)));
+    const isolated=F.filter(f=>f.chain_idx<0);
+    if(isolated.length){
+      const d=document.createElement('div');d.className='sdiv';d.textContent='Not in Any Chain';p.appendChild(d);
+      isolated.forEach(f=>p.appendChild(mkRow(f,true,null)));
+    }
+  } else {
+    const h=document.createElement('div');h.className='lhdr';h.textContent='All Findings ('+F.filter(x=>x.pri).length+')';p.appendChild(h);
+    F.filter(f=>f.pri).forEach(f=>p.appendChild(mkRow(f,false,null)));
+    const sec=F.filter(f=>!f.pri);
+    if(sec.length){
+      const d=document.createElement('div');d.className='sdiv';d.textContent='Not in Primary Chain';p.appendChild(d);
+      sec.forEach(f=>p.appendChild(mkRow(f,true,null)));
+    }
   }
 }
-function mkRow(f,dim){
+function mkRow(f,dim,chainNum){
   const r=document.createElement('div');r.className='frow'+(dim?' dim':'');r.id='row-'+f.id;r.onclick=()=>sel(f.id);
   const bar=document.createElement('div');bar.className='fbar';bar.style.background=sc(f.lbl);
   const score=document.createElement('div');score.className='fscore';score.style.color=sc(f.lbl);score.textContent=fmt(f.s);
@@ -416,6 +533,7 @@ function mkRow(f,dim){
   const bs=document.createElement('span');bs.className='bsev';bs.style.background=sc(f.lbl);bs.textContent=f.lbl;
   badges.appendChild(bs);
   if(f.mitre){const bm=document.createElement('span');bm.className='bmitre';bm.textContent=f.mitre;badges.appendChild(bm);}
+  if(chainNum!=null){const bc=document.createElement('span');bc.className='cbadge';bc.textContent='C'+chainNum;badges.appendChild(bc);}
   info.appendChild(title);info.appendChild(badges);
   r.appendChild(bar);r.appendChild(score);r.appendChild(info);return r;
 }
@@ -452,17 +570,22 @@ function closeDrawer(){
 function svgE(t){return document.createElementNS('http://www.w3.org/2000/svg',t)}
 
 function buildSVG(){
-  const wrap=document.getElementById('right');
+  const wrap=document.getElementById('right-inner');
   const W=(wrap.clientWidth-48)||700;
   const svg=document.getElementById('chain-svg');
   svg.innerHTML='';
 
+  // Use active chain's layout (falls back to NODE_LAYOUT for backward compat)
+  const activeLayout=CHAINS.length>0?CHAINS[ACTIVE_CHAIN].layout:NODE_LAYOUT;
+  const activeCrownId=CHAINS.length>0?CHAINS[ACTIVE_CHAIN].crown_id:'';
+  const activeEntryId=CHAINS.length>0?CHAINS[ACTIVE_CHAIN].entry_id:'';
+
   const PX=16,CW=W-PX*2,NH=64,VG=52,RS=NH+VG,HG=12,TP=8;
 
-  // Build L from injected NODE_LAYOUT
+  // Build L from active chain layout
   const L={};
-  const maxRow=Object.values(NODE_LAYOUT).reduce((m,n)=>Math.max(m,n.row),0);
-  Object.entries(NODE_LAYOUT).forEach(([id,nl])=>{
+  const maxRow=Object.values(activeLayout).reduce((m,n)=>Math.max(m,n.row),0);
+  Object.entries(activeLayout).forEach(([id,nl])=>{
     const tc=nl.total_cols;
     const y=TP+nl.row*RS;
     const w=tc===1?CW:(CW-(tc-1)*HG)/tc;
@@ -508,14 +631,17 @@ function buildSVG(){
     }
   }
 
-  // Dynamic connectors: for each primary finding, draw arrow FROM each primary parent TO it
-  F.filter(f=>f.pri).forEach(f=>{
+  // Get fork_labels for active chain
+  const activeForkLabels=(CHAINS.length>0&&CHAINS[ACTIVE_CHAIN].fork_labels)||{};
+
+  // Dynamic connectors: for each active primary finding, draw arrow FROM each primary parent TO it
+  F.filter(f=>ACTIVE_PRIMARY_IDS.has(f.id)).forEach(f=>{
     (f.ena||[]).forEach(parentId=>{
       if(!L[parentId]||!L[f.id])return;
       const parent=cn(parentId);
       const child=cn(f.id);
       // parent is lower on screen (larger row), child is above (smaller row)
-      drawConn(parent.cx,parent.top,child.cx,child.bot+2,FM[parentId].lbl,f.flbl||null);
+      drawConn(parent.cx,parent.top,child.cx,child.bot+2,FM[parentId].lbl,activeForkLabels[f.id]||null);
     });
   });
 
@@ -523,6 +649,8 @@ function buildSVG(){
   const font="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif";
   Object.keys(L).forEach(id=>{
     const f=FM[id],nl=L[id];if(!f||!nl)return;
+    const isCrown=f.id===activeCrownId;
+    const isEntry=f.id===activeEntryId;
     const sv=SEV[f.lbl]||SEV.INFO,col=sv.color;
     const g=svgE('g');g.className='ngrp';g.addEventListener('click',()=>sel(f.id));
 
@@ -538,9 +666,9 @@ function buildSVG(){
     bg.setAttribute('x',nl.x);bg.setAttribute('y',nl.y);
     bg.setAttribute('width',nl.w);bg.setAttribute('height',nl.h);
     bg.setAttribute('rx',5);
-    bg.setAttribute('fill',f.crown?sv.bg:'#ffffff');
-    bg.setAttribute('stroke',f.crown?col:sv.border);
-    bg.setAttribute('stroke-width',f.crown?'1.5':'1');
+    bg.setAttribute('fill',isCrown?sv.bg:'#ffffff');
+    bg.setAttribute('stroke',isCrown?col:sv.border);
+    bg.setAttribute('stroke-width',isCrown?'1.5':'1');
     bg.setAttribute('class','nrect');bg.id='nr-'+f.id;
     g.appendChild(bg);
 
@@ -589,7 +717,7 @@ function buildSVG(){
     titT.textContent=tstr;g.appendChild(titT);
 
     // Crown jewel badge
-    if(f.crown){
+    if(isCrown){
       const bW=102,bH=17,bX=nl.x+nl.w-bW-10,bY=nl.y+7;
       const cbg=svgE('rect');
       cbg.setAttribute('x',bX);cbg.setAttribute('y',bY);
@@ -605,7 +733,7 @@ function buildSVG(){
     }
 
     // Entry point badge
-    if(f.entry){
+    if(isEntry){
       const bW=94,bH=17,bX=nl.x+nl.w-bW-10,bY=nl.y+7;
       const ebg=svgE('rect');
       ebg.setAttribute('x',bX);ebg.setAttribute('y',bY);
@@ -631,7 +759,7 @@ function buildSVG(){
   axl.setAttribute('stroke','#e4e7ec');axl.setAttribute('stroke-width','1.5');
   svg.appendChild(axl);
 
-  const TI=F.filter(f=>f.pri&&(f.time||f.step!=null)).sort((a,b)=>(a.step||0)-(b.step||0));
+  const TI=F.filter(f=>ACTIVE_PRIMARY_IDS.has(f.id)&&(f.time||f.step!=null)).sort((a,b)=>(a.step||0)-(b.step||0));
   if(TI.length){
     const step=CW/(TI.length+1);
     TI.forEach((ti,i)=>{
@@ -669,9 +797,17 @@ function exportHTML(){
 
 function init(){
   buildLeft();
+  buildTabs();
+  // Set chain header text for active chain
+  if(CHAINS.length>0){
+    const c=CHAINS[0];
+    document.getElementById('chain-hdr').textContent=
+      (CHAINS.length>1?c.label:'Primary Attack Chain')+' \u2014 '+c.steps+' Steps';
+  }
   requestAnimationFrame(()=>requestAnimationFrame(()=>{
     buildSVG();
-    const crown=F.find(f=>f.crown);
+    const crownId=CHAINS.length>0?CHAINS[0].crown_id:'';
+    const crown=F.find(f=>f.id===crownId||f.crown);
     if(crown)setTimeout(()=>sel(crown.id),60);
   }));
 }

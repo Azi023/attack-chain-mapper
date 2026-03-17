@@ -22,10 +22,11 @@ import click
 from src.ingestion.detector import detect_format, detect_format_from_file, describe_field_mapping
 from src.ingestion.adapters import get_adapter
 from src.ingestion.validator import validate
-from src.graph.builder import build_graph
+from src.graph.builder import build_graph, get_node_finding
 from src.graph.inference import infer_and_build, mark_inferred_edges
-from src.graph.pathfinder import find_primary_chain, find_secondary_findings
-from src.graph.scorer import compute_chain_risk_score
+from src.graph.pathfinder import find_all_chains, find_primary_chain, find_secondary_findings
+from src.graph.scorer import compute_chain_risk_score, total_engagement_risk as calc_total_risk
+from src.graph.scorer import score_all_chains
 from src.renderer.html import render_to_file
 from src.renderer.json_export import export_graph_json
 
@@ -264,18 +265,39 @@ def _run_chain(
     if inferred_ids:
         mark_inferred_edges(G, inferred_ids)
 
-    click.echo("Finding primary chain...")
-    primary_chain = find_primary_chain(G)
-    secondary = find_secondary_findings(G, primary_chain)
-    risk_score = compute_chain_risk_score(primary_chain)
+    click.echo("Finding chains...")
+    chains = find_all_chains(G)
+    findings_by_id = {f.id: f for f in engagement.findings}
+    chains = score_all_chains(chains, findings_by_id)
 
-    click.echo(f"  Primary chain: {len(primary_chain)} steps")
-    for i, f in enumerate(primary_chain):
-        inferred_note = " [inferred]" if f.id in inferred_ids else ""
-        arrow = "→ " if i > 0 else "  "
-        click.echo(f"    {arrow}[{f.severity_label}] {f.title}{inferred_note}")
+    for cr in chains:
+        path_findings = [get_node_finding(G, nid) for nid in cr.primary_path if get_node_finding(G, nid)]
+        click.echo(f"  {cr.label} ({cr.chain_risk_score:.2f}): {len(path_findings)} steps")
+        for i, f in enumerate(path_findings):
+            inferred_note = " [inferred]" if f.id in inferred_ids else ""
+            arrow = "→ " if i > 0 else "  "
+            click.echo(f"    {arrow}[{f.severity_label}] {f.title}{inferred_note}")
+
+    primary_chain = []
+    if chains:
+        for nid in chains[0].primary_path:
+            f = get_node_finding(G, nid)
+            if f is not None:
+                primary_chain.append(f)
+
+    all_primary_ids: set[str] = set()
+    for cr in chains:
+        all_primary_ids.update(cr.primary_path)
+    secondary = [f for f in engagement.findings if f.id not in all_primary_ids]
+    secondary.sort(key=lambda f: f.severity, reverse=True)
+
+    risk_score = chains[0].chain_risk_score if chains else 0.0
+    eng_risk = calc_total_risk(chains)
+
     click.echo(f"  Secondary findings: {len(secondary)}")
     click.echo(f"  Chain risk score: {risk_score}")
+    if len(chains) > 1:
+        click.echo(f"  Total engagement risk: {eng_risk}")
 
     # ── AI enrichment ────────────────────────────────────────────────────────
     from src.ai.client import AIClient
@@ -294,16 +316,44 @@ def _run_chain(
             G = build_graph(engagement.findings)
             if inferred_ids:
                 mark_inferred_edges(G, inferred_ids)
-            primary_chain = find_primary_chain(G)
-            secondary = find_secondary_findings(G, primary_chain)
+            chains = find_all_chains(G)
+            findings_by_id = {f.id: f for f in engagement.findings}
+            chains = score_all_chains(chains, findings_by_id)
+            primary_chain = []
+            if chains:
+                for nid in chains[0].primary_path:
+                    f = get_node_finding(G, nid)
+                    if f is not None:
+                        primary_chain.append(f)
+            all_primary_ids = set()
+            for cr in chains:
+                all_primary_ids.update(cr.primary_path)
+            secondary = [f for f in engagement.findings if f.id not in all_primary_ids]
+            secondary.sort(key=lambda f: f.severity, reverse=True)
+            risk_score = chains[0].chain_risk_score if chains else 0.0
+            eng_risk = calc_total_risk(chains)
         except Exception as e:
             click.echo(f"  Warning: AI enrichment failed: {e}", err=True)
     else:
         click.echo("\n  No API key — using pre-written AI details from fixture (if present)")
 
+    # ── Build AttackChain object ─────────────────────────────────────────────
+    from src import AttackChain
+    attack_chain = AttackChain(
+        engagement=engagement,
+        primary_path=primary_chain,
+        secondary_findings=secondary,
+        chain_risk_score=risk_score,
+        inferred_ids=inferred_ids,
+        chains=chains,
+        total_engagement_risk=eng_risk,
+        chain_count=len(chains),
+    )
+
     # ── Render ───────────────────────────────────────────────────────────────
     click.echo(f"\nRendering HTML → {output_path}...")
-    render_to_file(engagement, primary_chain, secondary, risk_score, output_path)
+    html_content = attack_chain.render_html()
+    output_path.write_text(html_content, encoding="utf-8")
     size_kb = output_path.stat().st_size / 1024
     click.echo(f"  Written: {output_path} ({size_kb:.1f} KB)")
 
@@ -316,14 +366,6 @@ def _run_chain(
     # ── Persist to SQLite ────────────────────────────────────────────────────
     try:
         from src.storage.store import ChainStore
-        from src import AttackChain
-        attack_chain = AttackChain(
-            engagement=engagement,
-            primary_path=primary_chain,
-            secondary_findings=secondary,
-            chain_risk_score=risk_score,
-            inferred_ids=inferred_ids,
-        )
         store = ChainStore(db_path=db_path)
         chain_id = store.save_chain(attack_chain, engagement, html_path=str(output_path))
         store.close()

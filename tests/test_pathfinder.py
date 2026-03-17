@@ -3,7 +3,7 @@ import pytest
 
 from src.ingestion.schema import Finding
 from src.graph.builder import build_graph
-from src.graph.pathfinder import find_primary_chain, find_secondary_findings
+from src.graph.pathfinder import find_primary_chain, find_secondary_findings, find_all_chains, ChainResult
 from src.graph.scorer import compute_chain_risk_score, severity_color, label_color
 
 
@@ -159,6 +159,91 @@ class TestChainRiskScore:
         ]
         score = compute_chain_risk_score(chain)
         assert score > 0
+
+
+class TestFindAllChains:
+    def test_two_independent_chains_detected(self):
+        """Two disconnected components → two ChainResult objects"""
+        findings = [
+            # Chain A: web app
+            make_finding("wa-recon", severity=0.5),
+            make_finding("wa-xss", severity=7.0, enabled_by=["wa-recon"]),
+            # Chain B: AD
+            make_finding("ad-recon", severity=0.5),
+            make_finding("ad-ldap", severity=3.0, enabled_by=["ad-recon"]),
+            make_finding("ad-ntlm", severity=9.5, enabled_by=["ad-ldap"]),
+        ]
+        G = build_graph(findings)
+        chains = find_all_chains(G)
+        assert len(chains) == 2
+
+    def test_three_chains_sorted_by_risk(self):
+        """Highest-risk chain is Chain 1"""
+        findings = [
+            # High-risk chain
+            make_finding("h1", severity=0.5),
+            make_finding("h2", severity=9.8, enabled_by=["h1"]),
+            # Medium-risk chain
+            make_finding("m1", severity=0.5),
+            make_finding("m2", severity=5.0, enabled_by=["m1"]),
+            # Low-risk isolated node
+            make_finding("l1", severity=2.0),
+        ]
+        G = build_graph(findings)
+        chains = find_all_chains(G)
+        assert len(chains) == 3
+        # Highest risk chain should be Chain 1
+        assert chains[0].chain_index == 1
+        assert chains[0].chain_risk_score >= chains[1].chain_risk_score >= chains[2].chain_risk_score
+
+    def test_single_node_component_is_valid_chain(self):
+        """An isolated finding becomes a 1-node chain, not discarded"""
+        findings = [
+            make_finding("connected-a", severity=5.0),
+            make_finding("connected-b", severity=8.0, enabled_by=["connected-a"]),
+            make_finding("isolated", severity=3.0),  # no edges
+        ]
+        G = build_graph(findings)
+        chains = find_all_chains(G)
+        chain_sizes = [cr.component_size for cr in chains]
+        assert 1 in chain_sizes  # isolated node is a 1-node chain
+        assert any(cr.primary_path == ["isolated"] for cr in chains)
+
+    def test_chain_label_uses_crown_jewel_title(self):
+        """Chain label = 'Chain N — {crown_jewel_title[:40]}'"""
+        findings = [
+            make_finding("entry", severity=0.5),
+            make_finding("crown_finding_unique_title", severity=9.5, enabled_by=["entry"]),
+        ]
+        # Override title to something specific
+        findings[1] = Finding(
+            id="crown_finding_unique_title",
+            title="Domain Admin via NTLM Relay Attack",
+            severity=9.5,
+            severity_label="CRITICAL",
+            enabled_by=["entry"],
+        )
+        G = build_graph(findings)
+        chains = find_all_chains(G)
+        assert len(chains) == 1
+        assert "Chain 1" in chains[0].label
+        assert "Domain Admin via NTLM Relay Attack" in chains[0].label
+
+    def test_backward_compat_primary_path(self):
+        """find_primary_chain still returns Finding objects after multi-chain refactor"""
+        findings = [
+            make_finding("a", severity=2.0),
+            make_finding("b", severity=9.0, enabled_by=["a"]),
+            make_finding("c", severity=1.0),  # isolated
+        ]
+        G = build_graph(findings)
+        primary = find_primary_chain(G)
+        assert isinstance(primary, list)
+        assert all(isinstance(f, Finding) for f in primary)
+        # highest-risk chain has a→b
+        chain_ids = [f.id for f in primary]
+        assert "a" in chain_ids
+        assert "b" in chain_ids
 
 
 class TestSeverityColors:
