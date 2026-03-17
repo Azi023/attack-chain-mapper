@@ -57,6 +57,22 @@ def _compute_primary_layout(
                 level[pred_id] = level[nid] + 1
                 queue.append(pred_id)
 
+    # Add bridge nodes: non-primary findings that directly enable a primary node.
+    # Placed one row below the highest primary node they feed into so connectors
+    # render correctly in fork/converge topologies (e.g. f-sysvol in GOAD fixture).
+    for f in all_findings:
+        if f.id in primary_ids or f.id in level:
+            continue
+        child_rows = [
+            level[child.id]
+            for child in all_findings
+            if child.id in primary_ids
+            and f.id in (child.enabled_by or [])
+            and child.id in level
+        ]
+        if child_rows:
+            level[f.id] = min(child_rows) + 1
+
     rows_by_level: dict[int, list[str]] = {}
     for nid, lvl in level.items():
         rows_by_level.setdefault(lvl, []).append(nid)
@@ -573,7 +589,12 @@ function buildSVG(){
   const wrap=document.getElementById('right-inner');
   const W=(wrap.clientWidth-48)||700;
   const svg=document.getElementById('chain-svg');
+
+  // Save arrowhead defs BEFORE clearing (svg.innerHTML='' destroys chain-defs)
+  const existingDefs=document.getElementById('chain-defs');
+  const savedDefs=existingDefs?existingDefs.cloneNode(true):null;
   svg.innerHTML='';
+  if(savedDefs)svg.appendChild(savedDefs);
 
   // Use active chain's layout (falls back to NODE_LAYOUT for backward compat)
   const activeLayout=CHAINS.length>0?CHAINS[ACTIVE_CHAIN].layout:NODE_LAYOUT;
@@ -597,10 +618,6 @@ function buildSVG(){
   const SVG_H=TLY+58;
   svg.setAttribute('viewBox','0 0 '+W+' '+SVG_H);
   svg.setAttribute('height',SVG_H);
-
-  // Preserve static defs (arrowhead markers arr-CRITICAL etc. already in HTML)
-  const existingDefs=document.getElementById('chain-defs');
-  if(existingDefs)svg.appendChild(existingDefs.cloneNode(true));
 
   // CONNECTORS — drawn before nodes so nodes render on top
   const cg=svgE('g');svg.appendChild(cg);
@@ -634,8 +651,10 @@ function buildSVG(){
   // Get fork_labels for active chain
   const activeForkLabels=(CHAINS.length>0&&CHAINS[ACTIVE_CHAIN].fork_labels)||{};
 
-  // Dynamic connectors: for each active primary finding, draw arrow FROM each primary parent TO it
-  F.filter(f=>ACTIVE_PRIMARY_IDS.has(f.id)).forEach(f=>{
+  // Dynamic connectors: iterate ALL findings so bridge nodes (converge parents
+  // not on the longest path, e.g. f-sysvol) also get connectors drawn.
+  // L-membership guards naturally limit drawing to nodes in the active layout.
+  F.forEach(f=>{
     (f.ena||[]).forEach(parentId=>{
       if(!L[parentId]||!L[f.id])return;
       const parent=cn(parentId);
