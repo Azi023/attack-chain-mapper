@@ -76,11 +76,15 @@ class AIClient:
             raw_response = message.content[0].text
             logger.debug("Raw AI response for %s: %s", finding.id, raw_response)
             result = json.loads(raw_response)
-            # Ensure all expected keys are present
+            # Handle remediation as list or string
+            remediation = result.get("remediation", "")
+            if isinstance(remediation, list):
+                remediation = "\n".join(str(r) for r in remediation)
             return {
                 "detail": result.get("detail", ""),
-                "remediation": result.get("remediation", ""),
+                "remediation": remediation,
                 "confidence": float(result.get("confidence", 0.0)),
+                "reasoning_mode": result.get("reasoning_mode", "unknown"),
             }
         except json.JSONDecodeError:
             logger.error(
@@ -101,6 +105,21 @@ class AIClient:
         Returns new Finding objects — originals are never mutated.
         """
         title_by_id = {f.id: f.title for f in findings}
+        total_steps = len(findings)
+
+        # Identify crown jewel: node with no successors that is in the primary path
+        # (approximated as the node with highest severity among terminal nodes)
+        terminal_nodes = [
+            f.id for f in findings
+            if f.id in graph and len(list(graph.successors(f.id))) == 0
+        ]
+        crown_jewel_id = None
+        if terminal_nodes:
+            finding_by_id = {f.id: f for f in findings}
+            crown_jewel_id = max(
+                terminal_nodes,
+                key=lambda fid: finding_by_id[fid].severity if fid in finding_by_id else 0,
+            )
 
         async def enrich_one(finding: Finding) -> Finding:
             predecessors = list(graph.predecessors(finding.id)) if finding.id in graph else []
@@ -108,6 +127,8 @@ class AIClient:
             context = {
                 "enabled_by_titles": [title_by_id.get(p, p) for p in predecessors],
                 "enables_titles": [title_by_id.get(s, s) for s in successors],
+                "total_steps": total_steps,
+                "is_crown_jewel": finding.id == crown_jewel_id,
             }
             result = await self.generate_finding_detail(finding, context)
             return finding.model_copy(update={

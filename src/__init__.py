@@ -61,6 +61,8 @@ def build_chain(
     api_key: Optional[str] = None,
     model: str = "claude-sonnet-4-5",
     infer_chain: bool = True,
+    store: bool = True,
+    db_path: Optional[str] = None,
 ) -> AttackChain:
     """Build an attack chain from raw engagement data.
 
@@ -70,6 +72,8 @@ def build_chain(
         api_key: Anthropic API key for AI enrichment; skipped if None
         model: Anthropic model ID
         infer_chain: if True, auto-infer enabled_by when not present in data
+        store: if True (default), auto-save the chain to SQLite
+        db_path: override the default DB path (~/.attack-chain-mapper/chains.db)
 
     Returns:
         AttackChain with primary_path, secondary_findings, render_html(), to_json()
@@ -114,10 +118,21 @@ def build_chain(
     secondary = find_secondary_findings(G, primary)
     risk_score = compute_chain_risk_score(primary)
 
-    return AttackChain(
+    attack_chain = AttackChain(
         engagement=engagement,
         primary_path=primary,
         secondary_findings=secondary,
         chain_risk_score=risk_score,
         inferred_ids=inferred_ids,
     )
+
+    if store:
+        try:
+            from src.storage.store import ChainStore
+            chain_store = ChainStore(db_path=db_path)
+            chain_store.save_chain(attack_chain, engagement)
+            chain_store.close()
+        except Exception:
+            pass  # Storage failures never block chain generation
+
+    return attack_chain
