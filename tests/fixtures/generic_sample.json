@@ -1,0 +1,42 @@
+{
+  "engagement_id": "test-engagement-001",
+  "target_name": "Test Target",
+  "findings": [
+    {
+      "id": "f-001",
+      "title": "Open Admin Port",
+      "severity": 2.5,
+      "severity_label": "LOW",
+      "mitre_technique": "T1046",
+      "step_index": 1,
+      "timestamp_offset_s": 0,
+      "enabled_by": [],
+      "evidence": "Port 22 open on 10.0.0.1",
+      "host": "10.0.0.1"
+    },
+    {
+      "id": "f-002",
+      "title": "Default Credentials",
+      "severity": 8.5,
+      "severity_label": "HIGH",
+      "mitre_technique": "T1078.001",
+      "step_index": 3,
+      "timestamp_offset_s": 300,
+      "enabled_by": ["f-001"],
+      "evidence": "admin:admin accepted on 10.0.0.1",
+      "host": "10.0.0.1"
+    },
+    {
+      "id": "f-003",
+      "title": "Remote Code Execution",
+      "severity": 9.5,
+      "severity_label": "CRITICAL",
+      "mitre_technique": "T1059.001",
+      "step_index": 5,
+      "timestamp_offset_s": 900,
+      "enabled_by": ["f-002"],
+      "evidence": "id command returned: uid=0(root)",
+      "host": "10.0.0.1"
+    }
+  ]
+}

