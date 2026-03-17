@@ -94,7 +94,7 @@ def render_html(
         if f.mitre_technique:
             mitre_html = f'<span class="mitre-badge">{_escape(f.mitre_technique)}</span>'
         left_panel_html += f"""
-        <div class="finding-item" id="left-{_escape(f.id)}" onclick="selectFinding('{_escape(f.id)}')" data-id="{_escape(f.id)}">
+        <div class="finding-item" id="left-{_escape(f.id)}" onclick="selectFinding('{_escape(f.id)}')" data-id="{_escape(f.id)}" data-has-ai="{'true' if f.ai_detail else 'false'}">
             <div class="finding-item-header">
                 <span class="severity-dot" style="background:{color}"></span>
                 <span class="severity-score" style="color:{color}">{f.severity:.1f}</span>
@@ -143,7 +143,7 @@ def render_html(
 
         chain_nodes_html += f"""
         {arrow_html}
-        <div class="chain-node" id="chain-{_escape(f.id)}" onclick="selectFinding('{_escape(f.id)}')" data-id="{_escape(f.id)}" style="--node-color:{color}">
+        <div class="chain-node" id="chain-{_escape(f.id)}" onclick="selectFinding('{_escape(f.id)}')" data-id="{_escape(f.id)}" style="--node-color:{color}" data-has-ai="{'true' if f.ai_detail else 'false'}">
             <div class="node-glow" style="box-shadow:0 0 0 0 {color}"></div>
             <div class="node-header">
                 <div class="node-severity-bar" style="background:{color}"></div>
@@ -919,12 +919,26 @@ function openDrawer(id) {{
             <div class="drawer-section-label">AI Analysis</div>
             <div class="drawer-section-content">${{esc(f.ai_detail)}}</div>
         </div>`;
+    }} else {{
+        html += `<div class="drawer-section">
+            <div class="drawer-section-label">AI Analysis</div>
+            <div class="drawer-section-content" style="color:var(--text-dim);font-style:italic">
+                Loading AI analysis… Run with --api-key to generate real-time analysis for this finding.
+            </div>
+        </div>`;
     }}
 
     if (f.ai_remediation) {{
         html += `<div class="drawer-section">
             <div class="drawer-section-label">Remediation</div>
             <div class="drawer-section-content">${{esc(f.ai_remediation)}}</div>
+        </div>`;
+    }} else if (f.ai_detail) {{
+        html += `<div class="drawer-section">
+            <div class="drawer-section-label">Remediation</div>
+            <div class="drawer-section-content" style="color:var(--text-dim);font-style:italic">
+                Remediation guidance will appear after AI enrichment.
+            </div>
         </div>`;
     }}
 

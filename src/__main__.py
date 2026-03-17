@@ -15,9 +15,10 @@ from pathlib import Path
 
 import click
 
-from src.ingestion.detector import detect_format_from_file
+from src.ingestion.detector import detect_format_from_file, describe_field_mapping
 from src.ingestion.adapters import get_adapter
 from src.graph.builder import build_graph
+from src.graph.inference import infer_and_build, mark_inferred_edges
 from src.graph.pathfinder import find_primary_chain, find_secondary_findings
 from src.graph.scorer import compute_chain_risk_score
 from src.renderer.html import render_to_file
@@ -32,25 +33,38 @@ def cli():
 @cli.command()
 @click.argument("path", type=click.Path(exists=True))
 def discover(path: str):
-    """Detect format and print field mapping for a findings JSON file."""
+    """Detect format and print a detailed field mapping for a findings JSON file."""
     input_path = Path(path)
     format_name, data = detect_format_from_file(input_path)
     adapter_cls = get_adapter(format_name)
     adapter = adapter_cls()
-    mapping = adapter.describe_mapping(data)
+    mapping = describe_field_mapping(data, format_name)
 
-    click.echo(f"\n  File:    {input_path.name}")
-    click.echo(f"  Adapter: {mapping['adapter']}")
-    click.echo(f"  Findings found: {mapping['sample_count']}\n")
+    click.echo(f"\n  File:        {input_path.name}")
+    click.echo(f"  Format:      {format_name}")
+    click.echo(f"  Findings:    {mapping['sample_count']}")
+    click.echo(f"  Chain links: {mapping['chain_note']}\n")
 
     if mapping["mapped_fields"]:
-        click.echo("  Mapped fields:")
+        click.echo("  Field mapping:")
         for m in mapping["mapped_fields"]:
-            click.echo(f"    {m['source_field']:<30} → {m['maps_to']}")
+            source = f"[source: {m['source_field']}]" if m['source_field'] != m['canonical'] else ""
+            click.echo(f"    {m['canonical']:<28} ✓ found  {source}")
 
-    if mapping["unmapped_fields"]:
-        click.echo("\n  Unmapped fields (will be ignored):")
-        for f in mapping["unmapped_fields"]:
+    if mapping["missing_critical"]:
+        click.echo("\n  Missing CRITICAL fields (will impair chain quality):")
+        for f in mapping["missing_critical"]:
+            note = "chain inference will be applied" if f == "enabled_by" else "will be auto-generated"
+            click.echo(f"    {f:<28} ✗ missing — {note}")
+
+    if mapping["missing_optional"]:
+        click.echo("\n  Missing optional fields (will be null):")
+        for f in mapping["missing_optional"]:
+            click.echo(f"    {f:<28} — not present")
+
+    if mapping["unmapped_source_fields"]:
+        click.echo("\n  Unrecognised source fields (ignored):")
+        for f in mapping["unmapped_source_fields"]:
             click.echo(f"    {f}")
 
     click.echo(
@@ -64,9 +78,10 @@ def discover(path: str):
 @click.option("--output", "-o", required=True, help="Output HTML file path")
 @click.option("--model", default="claude-sonnet-4-5", help="Anthropic model for AI details")
 @click.option("--api-key", default=None, envvar="ANTHROPIC_API_KEY", help="Anthropic API key")
-@click.option("--format", "format_override", default=None, help="Force adapter format (e.g. generic)")
+@click.option("--format", "format_override", default=None, help="Force adapter format (e.g. generic, strike7)")
 @click.option("--json-output", default=None, help="Also write graph JSON to this file")
-def chain(path: str, output: str, model: str, api_key: str | None, format_override: str | None, json_output: str | None):
+@click.option("--no-infer", is_flag=True, default=False, help="Disable chain inference for missing enabled_by")
+def chain(path: str, output: str, model: str, api_key: str | None, format_override: str | None, json_output: str | None, no_infer: bool):
     """Generate an attack chain HTML visualization from a findings file."""
     input_path = Path(path)
     output_path = Path(output)
@@ -79,10 +94,27 @@ def chain(path: str, output: str, model: str, api_key: str | None, format_overri
     adapter_cls = get_adapter(format_name)
     adapter = adapter_cls()
     engagement = adapter.parse(data)
-    click.echo(f"  Loaded {len(engagement.findings)} findings ({format_name} format)")
+    click.echo(f"  {len(engagement.findings)} findings loaded ({format_name} adapter)")
+
+    # Chain inference — auto-applied when enabled_by is missing
+    findings = engagement.findings
+    inferred_ids: set[str] = set()
+    if not no_infer:
+        findings, inferred_ids = infer_and_build(findings)
+        if inferred_ids:
+            click.echo(f"  Chain inference applied to {len(inferred_ids)} findings (no explicit enabled_by)")
+            from src.ingestion.schema import Engagement as Eng
+            engagement = Eng(
+                engagement_id=engagement.engagement_id,
+                target_name=engagement.target_name,
+                findings=findings,
+                metadata=engagement.metadata,
+            )
 
     click.echo("Building graph...")
     G = build_graph(engagement.findings)
+    if inferred_ids:
+        mark_inferred_edges(G, inferred_ids)
 
     click.echo("Finding primary chain...")
     primary_chain = find_primary_chain(G)
@@ -90,24 +122,30 @@ def chain(path: str, output: str, model: str, api_key: str | None, format_overri
     risk_score = compute_chain_risk_score(primary_chain)
 
     click.echo(f"  Primary chain: {len(primary_chain)} steps")
+    for i, f in enumerate(primary_chain):
+        inferred_note = " [inferred]" if f.id in inferred_ids else ""
+        arrow = "→ " if i > 0 else "  "
+        click.echo(f"    {arrow}[{f.severity_label}] {f.title}{inferred_note}")
     click.echo(f"  Secondary findings: {len(secondary)}")
     click.echo(f"  Chain risk score: {risk_score}")
 
-    # AI enrichment (only if API key is available)
-    if api_key:
+    # AI enrichment
+    from src.ai.client import AIClient
+    ai = AIClient(api_key=api_key, model=model)
+    if ai.available:
         click.echo(f"Enriching with AI details ({model})...")
         try:
-            from src.ai.client import enrich_findings_sync
-            enriched = enrich_findings_sync(engagement.findings, G, api_key=api_key, model=model)
-            # Rebuild with enriched findings
-            from src.ingestion.schema import Engagement
-            engagement = Engagement(
+            enriched = ai.enrich_findings_sync(engagement.findings, G)
+            from src.ingestion.schema import Engagement as Eng
+            engagement = Eng(
                 engagement_id=engagement.engagement_id,
                 target_name=engagement.target_name,
                 findings=enriched,
                 metadata=engagement.metadata,
             )
             G = build_graph(engagement.findings)
+            if inferred_ids:
+                mark_inferred_edges(G, inferred_ids)
             primary_chain = find_primary_chain(G)
             secondary = find_secondary_findings(G, primary_chain)
         except Exception as e:
@@ -115,7 +153,7 @@ def chain(path: str, output: str, model: str, api_key: str | None, format_overri
     else:
         click.echo("  No API key — using pre-written AI details from fixture (if present)")
 
-    click.echo(f"Rendering HTML to {output_path}...")
+    click.echo(f"Rendering HTML → {output_path}...")
     render_to_file(engagement, primary_chain, secondary, risk_score, output_path)
     size_kb = output_path.stat().st_size / 1024
     click.echo(f"  Written: {output_path} ({size_kb:.1f} KB)")
@@ -137,41 +175,86 @@ def scaffold_adapter(path: str):
     with input_path.open() as fh:
         data = json.load(fh)
 
-    # Show a snippet of the data structure
-    snippet = json.dumps(data, indent=2)[:2000]
+    # Analyse structure
+    top_keys = list(data.keys()) if isinstance(data, dict) else ["[list]"]
+    snippet = json.dumps(data, indent=2)[:3000]
 
-    prompt = f"""You are building a custom adapter for the `attack-chain-mapper` tool.
+    # Find a sample finding
+    sample_finding = None
+    if isinstance(data, dict):
+        for key in ("findings", "results", "vulnerabilities", "issues", "vulns", "items"):
+            if isinstance(data.get(key), list) and data[key]:
+                sample_finding = data[key][0]
+                break
+    elif isinstance(data, list) and data:
+        sample_finding = data[0]
+
+    sample_str = json.dumps(sample_finding, indent=2) if sample_finding else "N/A"
+
+    # Key paths found
+    key_path_str = f"Top-level keys: {top_keys}"
+    if sample_finding and isinstance(sample_finding, dict):
+        key_path_str += f"\nFirst finding keys: {list(sample_finding.keys())}"
+
+    prompt = f"""You are writing a Python adapter for attack-chain-mapper.
 
 The input file is: {input_path.name}
 
-Here is a sample of the JSON structure (first 2000 chars):
+{key_path_str}
+
+Here is the full JSON structure (first 3000 chars):
 ```json
 {snippet}
 ```
 
-The adapter must:
-1. Map the input fields to the canonical Finding schema fields
-2. Be placed in `src/ingestion/adapters/<adapter_name>.py`
-3. Follow the same interface as `src/ingestion/adapters/generic.py` (GenericAdapter)
-4. Be 50-80 lines max
-5. Be registered in `src/ingestion/adapters/__init__.py`
+Sample finding object:
+```json
+{sample_str}
+```
 
-The canonical Finding schema is:
-- id: str (unique finding identifier)
-- title: str (short human title)
-- severity: float (0.0-10.0 CVSS-style)
-- severity_label: str (CRITICAL/HIGH/MEDIUM/LOW/INFO)
-- mitre_technique: Optional[str] (e.g. "T1557.001")
-- step_index: Optional[int] (sequential step number)
-- timestamp_offset_s: Optional[int] (seconds from engagement start)
-- enabled_by: List[str] (IDs of prerequisite findings)
-- evidence: Optional[str] (raw evidence text)
-- host: Optional[str] (target hostname/IP)
-- ai_detail: Optional[str] (pre-written detail, if available)
-- ai_remediation: Optional[str] (pre-written remediation, if available)
-- ai_confidence: Optional[float] (confidence 0.0-1.0)
+Write src/ingestion/adapters/custom.py that:
+1. Has a class CustomAdapter with:
+   - FORMAT_NAME = "custom"
+   - can_handle(cls, data: dict) -> bool  (return True if data matches this format)
+   - load(self, path) -> Engagement
+   - parse(self, data) -> Engagement
+   - describe_mapping(self, data) -> dict
 
-Write the complete adapter file and the registration line for __init__.py.
+2. Maps the source fields to List[Finding] using this LOCKED schema:
+```python
+class Finding(BaseModel):
+    id: str                           # required, unique
+    title: str                        # required
+    severity: float                   # required, 0.0-10.0 CVSS-style
+    severity_label: str               # CRITICAL/HIGH/MEDIUM/LOW/INFO
+    mitre_technique: Optional[str]    # e.g. "T1557.001"
+    step_index: Optional[int]         # sequential step number
+    timestamp_offset_s: Optional[int] # seconds from engagement start
+    enabled_by: List[str]             # IDs of prerequisite findings (can be [] if unknown)
+    evidence: Optional[str]           # raw evidence text
+    host: Optional[str]               # target hostname/IP
+    ai_detail: Optional[str]          # pre-written detail if available
+    ai_remediation: Optional[str]     # pre-written remediation if available
+    ai_confidence: Optional[float]    # confidence 0.0-1.0
+```
+
+3. Severity string → float mapping to use if severity is a label, not a number:
+   CRITICAL=9.5, HIGH=7.5, MEDIUM=5.0, LOW=2.5, INFO=0.5
+
+4. Handles missing fields gracefully — use None, never raise on missing optional fields.
+   The only required fields are id, title, severity, severity_label.
+
+5. If enabled_by is not in the source data, leave it as [] — chain inference will be applied automatically.
+
+Then add this registration line in src/ingestion/adapters/__init__.py:
+```python
+from src.ingestion.adapters.custom import CustomAdapter
+ADAPTER_REGISTRY["custom"] = CustomAdapter
+```
+
+The adapter should be 60-90 lines. No external dependencies beyond pydantic and the standard library.
+
+IMPORTANT: The schema is locked — never change Finding fields to match the source format. Always map the source to the schema, not the other way around.
 """
     click.echo(prompt)
 
